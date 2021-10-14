@@ -1,0 +1,487 @@
+stages:
+ - clone
+ - npm_install
+ - tests
+ - build_image
+ - dev_migrate
+ - newman
+ - security-scans
+ - helm_deploy_dev
+ - helm_rollback_dev
+ - helm_deploy_qa
+ - helm_rollback_qa
+ 
+ 
+variables:
+  [REDACTED]
+ 
+clone:
+  stage: clone
+  image: ${DEPLOY_DOCKER_IMAGE}
+  variables:
+    test: test
+  before_script:
+  - mkdir -pvm 0700 ~/.ssh
+  - echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa_gitlab_ci
+  - chmod 0400 ~/.ssh/id_rsa_gitlab_ci
+  - export GIT_SSH_COMMAND="ssh -i ~/.ssh/id_rsa_gitlab_ci -o StrictHostKeyChecking=no"
+  - git config --global user.email "[REDACTED]"
+  - git config --global user.name "[REDACTED]"
+  script:
+      - git clone git@[REDACTED].git pantheon
+      - cp Dockerfile docker-entrypoint.sh .dockerignore pantheon
+      - cp app.js pantheon/src/app.js
+      - cat pantheon/src/app.js
+  artifacts:
+    paths:
+    - pantheon
+   
+npm_install:
+  stage: npm_install
+  image : node:12.16.2
+  script:
+    - cd pantheon
+    - npm set registry ${SOARIZON_REGISTRY}
+    - npm install
+    - npm install @soarizon/auth-service@latest
+    - npm install @soarizon/aviation-data-service@latest
+    - npm install @soarizon/chat-service@latest
+    - npm install @soarizon/checklist-service@latest
+    - npm install @soarizon/compliance-service@latest
+    - npm install @soarizon/contact-service@latest
+    - npm install @soarizon/dal@latest
+    - npm install @soarizon/drone-service@latest
+    - npm install @soarizon/flight-logging-service@latest
+    - npm install @soarizon/hubspot@latest
+    - npm install @soarizon/logger@latest
+    - npm install @soarizon/mail@latest
+    - npm install @soarizon/mission-service@latest
+    - npm install @soarizon/notification-service@latest
+    - npm install @soarizon/organisation-service@latest
+    - npm install @soarizon/payment-service@latest
+    - npm install @soarizon/plan-service@latest
+    - npm install @soarizon/profile-service@latest
+    - npm install @soarizon/sanctuary@latest
+    - npm install @soarizon/zendesk-service@latest
+    - npm install --save dd-trace
+    - npm run build
+  artifacts:
+    expire_in: 1 mos
+    untracked: true
+    paths:
+      - pantheon/node_modules/
+      - pantheon/dist
+  retry:
+    max: 2
+    when:
+      - always
+ 
+master_migration:
+  stage: tests
+  image: ${NODE_IMAGE}
+  services:
+    - name: $MIGRATION_DOCKER_IMAGE
+      alias: postgres
+  before_script:
+    - npm install
+  needs:
+    - job: clone
+      artifacts: true
+    - job: npm_install
+      artifacts: true
+  variables:
+    POSTGRES_DBNAME: [REDACTED]
+    POSTGRES_USER: [REDACTED]
+    POSTGRES_PASS: "[REDACTED]"
+    POSTGRES_HOST_AUTH_METHOD: trust
+    # Configure postgres service (https://hub.docker.com/_/postgres/)
+    DB_HOST: [REDACTED]
+    DB_PORT: 5432
+    DB_NAME: [REDACTED]
+    DB_USER: [REDACTED]
+    DB_PASSWORD: [REDACTED]
+    DB_SSL: 0
+    Host: [REDACTED]
+    User: [REDACTED]
+    Password: [REDACTED]
+    Database: [REDACTED]
+  script:
+    - cd pantheon
+    - apt-get update
+    - apt-get install -y postgresql-client libpq-dev
+    - export PGPASSWORD=$POSTGRES_PASSWORD
+    - psql -h "postgres" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT 'OK' AS status;"
+    - psql -h "postgres" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT 'OK' AS status;"
+    # Schema Command --Due to windows pathing
+    - psql -h "$Host" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -w "$POSTGRES_DB" < src/db/sql/soarizon-with-data.sql
+    - npm run db:migrate
+    - npm run db:seed
+    - pg_dumpall --no-password --host=$DB_HOST --port=5432 --username="$POSTGRES_USER"  > ./dump_master.sql
+  artifacts:
+    expire_in: 1 mos
+    paths:
+      - ./pantheon/dump_master.sql
+  retry:
+    max: 2
+    when:
+      - always
+  tags:
+    - autoscale_premium
+ 
+build_image:
+  stage: build_image
+  image: docker
+  allow_failure: true
+  needs:
+    - job: clone
+      artifacts: true
+    - job: npm_install
+      artifacts: true
+  script:
+    - cd pantheon
+    - export VERSION=$(cat package.json | grep version\":\ | sed 's/[^0-9.]*//g')
+    - echo "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA"
+    - echo ${date}
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_JOB_TOKEN" "$CI_REGISTRY"
+    - ls -la && pwd
+    - docker build -t "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA" .
+    - docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA"
+    - docker tag $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA $CI_REGISTRY_IMAGE:latest
+    - docker push $CI_REGISTRY_IMAGE:latest
+    - docker tag $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA $CI_REGISTRY_IMAGE:$VERSION
+    - docker push "$CI_REGISTRY_IMAGE:$VERSION"
+  retry:
+    max: 2
+    when:
+      - always
+  only:
+    - master
+ 
+clamavscan:
+  stage: security-scans
+  allow_failure: true
+  image: ubuntu
+  script:
+    - apt-get update
+    - apt-get install clamav clamav-daemon wget -y
+    - freshclam
+    - ls -lth
+    - clamscan -r -i --bell pantheon > clamav-results.txt
+    - cat clamav-results.txt
+    - |
+      if grep "Infected files: 0" clamav-results.txt ; then
+        echo "0 infected file all good" ;
+      else
+        echo "Infected files found "
+        false
+      fi
+  artifacts:
+    expire_in: 1 mos
+    paths:
+     - clamav-results.txt
+    when: always
+  needs:
+    - job: clone
+      artifacts: true
+    - job: npm_install
+      artifacts: true
+    - job: build_image
+  retry:
+    max: 2
+    when:
+      - always
+  only:
+    - master
+ 
+docker_container_scan:
+  stage: security-scans
+  allow_failure: true
+  image: ubuntu
+  script:
+    - cd pantheon
+    - apt-get update && apt-get install docker.io -y
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_JOB_TOKEN" "$CI_REGISTRY"
+    - docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+    - docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v $HOME/Library/Caches:/root/.cache/ -e TRIVY_DEBUG=TRUE -e TRIVY_TIMEOUT=5m  aquasec/trivy $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA  > container_scan_report.txt
+    - cat container_scan_report.txt
+    - |
+      if grep  -c "CRITICAL: 0" container_scan_report.txt    ; then
+        echo "Critical = 0 for both reports , passing "
+      else
+        echo "Critical issues founds failing"
+        false
+      fi
+  artifacts:
+    expire_in: 1 mos
+    paths:
+     - pantheon/container_scan_report.txt
+    when: always
+  needs:
+    - job: clone
+      artifacts: true
+    - job: npm_install
+      artifacts: true
+    - job: build_image
+  retry:
+    max: 2
+    when:
+      - always
+  only:
+    - master
+ 
+dev_migrate:
+  stage: dev_migrate
+  image:  ${NODE_IMAGE}
+  variables:
+    DB_HOST: $DEV_DB_HOST
+    DB_PORT: 5432
+    DB_NAME: [REDACTED]
+    DB_USER: [REDACTED]
+    DB_PASSWORD:  $DEV_DB_ADMIN_PASSWORD
+    DB_SSL: 1
+  script:
+    - cd pantheon
+    - npm run db:migrate
+  needs:
+    - job: clone
+      artifacts: true
+    - job: npm_install
+      artifacts: true
+  retry:
+    max: 2
+    when:
+      - always
+  tags:
+    - autoscale_premium
+  only:
+    - master
+ 
+newman:
+  stage: newman
+  image: ${NODE_IMAGE}
+  variables:
+    #Preprod
+    orig_hostname: [REDACTED]
+    orig_client_id: [REDACTED]
+    orig_scope: https://tdfmvpb2c.onmicrosoft.com/b2c-api/default
+    #V2 DEV
+    new_hostname: [REDACTED]
+    new_client_id: [REDACTED]
+    new_scope: https://tdfmvpb2c.onmicrosoft.com/[REDACTED]/default
+  before_script:
+    - npm install newman -g
+  script:
+    # replace host / api
+    - sed -i  "s~$orig_hostname~$new_hostname~g" test/newman/K8s_PantheonGQLEnv.postman_environment.json
+    # replace Client ID
+    - sed -i  "s~$orig_client_id~$new_client_id~g" test/newman/K8s_PantheonGQL.postman_collection.json
+    # Replace userflow :
+    - sed -i  "s~$orig_scope~$new_scope~g" test/newman/K8s_PantheonGQL.postman_collection.json
+    # Repalce Client Secret
+    - sed -i  "s~REPLACEWITHCLIENT_SECRET~$POSTMAN_CLIENT_SECRET~g" test/newman/K8s_PantheonGQLEnv.postman_environment.json
+    # Replace Client password
+    - sed -i  s/REPLACEWITHCLIENT_PASSWORD/$POSTMAN_CLIENT_PASSWORD/g test/newman/K8s_PantheonGQLEnv.postman_environment.json
+    # Replace Stripe plan id
+    - sed -i  s/REPLACEWITHPLAN_ID/$POSTMAN_PLAN_ID/g test/newman/K8s_PantheonGQLEnv.postman_environment.json
+    # Replace user id
+    - sed -i  s/REPLACEWITHUSER_ID/$POSTMAN_USER_ID/g test/newman/K8s_PantheonGQLEnv.postman_environment.json
+    # Replace organisation id
+    - sed -i  s/REPLACEWITHORGANISATION_ID/$POSTMAN_ORGANISATION_ID/g test/newman/K8s_PantheonGQLEnv.postman_environment.json
+    #RUN NEWMAN
+    - newman run test/newman/K8s_PantheonGQL.postman_collection.json -e test/newman/K8s_PantheonGQLEnv.postman_environment.json  --reporters cli,junit --reporter-junit-export newman.xml
+  needs:
+  - job: dev_migrate
+  artifacts:
+    expire_in: 1 yrs
+    paths:
+      - newman.xml
+  retry:
+    max: 2
+    when:
+     - always
+  tags:
+    - autoscale_premium
+  only:
+    - master
+  except:
+    variables:
+      - $DISABLE_NEWMAN
+ 
+qa_migrate:
+  stage: dev_migrate
+  image:  ${NODE_IMAGE}
+  variables:
+    DB_HOST: $QA_DB_HOST
+    DB_PORT: 5432
+    DB_NAME: [REDACTED]
+    DB_USER: [REDACTED]
+    DB_PASSWORD:  $QA_DB_ADMIN_PASSWORD
+    DB_SSL: 1
+  script:
+    - cd pantheon
+    - npm run db:migrate
+  needs:
+    - job: clone
+      artifacts: true
+    - job: npm_install
+      artifacts: true
+  retry:
+    max: 2
+    when:
+      - always
+  tags:
+    - autoscale_premium
+  only:
+    - master
+ 
+helm_deploy_dev:
+  stage: helm_deploy_dev
+  image: ${DEPLOY_DOCKER_IMAGE}
+  variables:
+    KUBECONFIG: ${CI_PROJECT_DIR}/kube_config
+    NODE_VERSION: "node:12.13-buster-sli"
+    PROJECT_NAME: "[REDACTED]"
+    APP_NAME: "[REDACTED]"
+    HELM_VERSION: "dtzar/helm-kubectl:3.1.1"
+    APPLICATION_PORT: 80 # default value, mut be adjusted to your needs
+    REPLICACOUNT: 1 # default Used to guarantee the availability of a specified number of identical Pods.
+    CI_DEBUG_TRACE: "false"
+    DB_PORT: 5432
+    DB_NAME: [REDACTED]
+    CLIENT_APP_NAME: "[REDACTED]"
+    IAM_FRONT_CLIENT_ID: [REDACTED]
+    POSTMAN_USER_ID: [REDACTED]
+    HELM_EXPERIMENTAL_OCI:  1
+    DEV_API_URL: "[REDACTED]"
+  needs:
+    - job: dev_migrate
+    - job: docker_container_scan
+  before_script:
+    - export  HELM_EXPERIMENTAL_OCI=1
+    - az login --service-principal --username [REDACTED]  --password ${AZURE_CONTAINER_REGISTRY_USER} --tenant [REDACTED]
+    - helm registry login [REDACTED]   --username [REDACTED]  --password ${AZURE_CONTAINER_REGISTRY_USER}
+    - export LOWER_CASE_APP_NAME="$(echo "${APP_NAME}" | tr A-Z a-z | sed "s~/~~g"  )"
+    - export DNS_APP_NAME="$(echo "${APP_NAME}" | tr A-Z a-z |   sed "s~/~~g" | sed "s~-~~g"  )"
+    - echo ${KUBE_CONFIG_DEV} | base64 -d > ${KUBECONFIG}
+    - export KUBECONFIG=${KUBECONFIG}
+    - helm chart pull [REDACTED]/helm/panth-api:latest
+    - helm chart export [REDACTED]/helm/panth-api:latest --destination .
+    - ls -lth
+    - cd story-api/
+    - echo ${CLIENT_URL}
+  script:
+    - export LOWER_CASE_APP_NAME="$(echo "${APP_NAME}" | tr A-Z a-z | sed "s~/~~g"  )"
+    - export DNS_APP_NAME="$(echo "${APP_NAME}" | tr A-Z a-z |   sed "s~/~~g" | sed "s~-~~g"  )"
+    - echo "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA"
+    - export CLIENT_LOWER_CASE_APP_NAME="$(echo "${CLIENT_APP_NAME}" | tr A-Z a-z | sed "s~/~~g"  )"
+    - export CLIENT_DNS_APP_NAME="$(echo "${CLIENT_APP_NAME}" | tr A-Z a-z |   sed "s~/~~g" | sed "s~-~~g"  )"
+    - export CLIENT_URL="[REDACTED]"
+    - echo $CLIENT_URL
+    - kubectl get pods -n dev
+    - echo " >>>>>>>>>> Deploy in progress for tdf-montreal-k8s in DEV <<<<<<<<<< "
+    - helm dep update
+    - >
+      helm upgrade --install ${LOWER_CASE_APP_NAME}
+      --set ingress.hosts[0].host="${DNS_APP_NAME}.dev.${PROJECT_NAME}.[REDACTED]"
+      --set ingress.hosts[0].paths[0]="/"
+      --set ingress.tls[0].hosts[0]="${DNS_APP_NAME}.dev.${PROJECT_NAME}.[REDACTED]"
+      --set ingress.tls[0].secretName="${LOWER_CASE_APP_NAME}-tls"
+      --set stripeingress.hosts[0].host="[REDACTED].${PROJECT_NAME}.[REDACTED]"
+      --set stripeingress.hosts[0].paths[0]="/"
+      --set stripeingress.tls[0].hosts[0]="[REDACTED].${PROJECT_NAME}.[REDACTED]"
+      --set stripeingress.tls[0].secretName="soarizonapistripe-tls"
+      --set nameOverride=${LOWER_CASE_APP_NAME}
+      --set replicaCount=${REPLICACOUNT}
+      --set serviceAccount.name=developer-role
+      --set image.repository=[REDACTED]
+      --set image.tag=${CI_COMMIT_SHA}
+      --set image.pullSecret=[REDACTED]
+      --set environment.DB_HOST=${DEV_DB_HOST} 
+      --set environment.DB_USER="[REDACTED]"
+      --set environment.DB_NAME=${DB_NAME} 
+      --set environment.DB_PASSWORD=${DEV_DB_ADMIN_PASSWORD}
+      --set environment.DB_PORT=${DB_PORT}
+      --set environment.IAM_FRONT_CLIENT_ID=${IAM_FRONT_CLIENT_ID}
+      --set environment.IAM_JWKS_URL=${DEV_IAM_JWKS_URL}
+      --set environment.CLIENT_URL=${CLIENT_URL}
+      --set environment.DARK_SKY_API_KEY=${DARK_SKY_API_KEY}
+      --set environment.HUBSPOT_API_KEY=${HUBSPOT_API_KEY}
+      --set environment.MAPTILER_API_KEY=${MAPTILER_API_KEY}
+      --set environment.SNOWFLAKE_API_KEY=${SNOWFLAKE_API_KEY}
+      --set environment.REDIS_PASSWORD=${LOWER_CASE_APP_NAME}-redis
+      --set redis.fullnameOverride=${LOWER_CASE_APP_NAME}-redis 
+      --set redis.usePassword=true
+      --set redis.password=${LOWER_CASE_APP_NAME}-redis
+      --set environment.REDIS_SERVICE="${LOWER_CASE_APP_NAME}-redis-master"
+      --set redis.cluster.enabled="false"
+      --set environment.POSTMAN_USER_ID=${POSTMAN_USER_ID} 
+      --set environment.POSTMAN_USER_AZURE_ID=${POSTMAN_USER_AZURE_ID}
+      --set environment.POSTMAN_PLAN_ID=${POSTMAN_PLAN_ID} 
+      --set environment.ZENDESK_KEY=${ZENDESK_KEY} 
+      --set environment.SMTP_HOST=${SMTP_HOST} 
+      --set environment.STRIPE_SECRET=${STRIPE_SECRET} 
+      --set environment.STRIPE_WH_SUBSCRIPTION=${K8S_DEV_STRIPE_WH_SUBSCRIPTION} 
+      --set environment.STRIPE_API_VERSION=${STRIPE_API_VERSION} 
+      --set environment.SENDGRID_API_KEY=${SENDGRID_API_KEY}
+      --set environment.API_URL=${DEV_API_URL}
+      --namespace dev --wait --debug .  
+  only:
+    - master
+ 
+helm_rollback_dev:
+  stage: helm_rollback_dev
+  image: ${DEPLOY_DOCKER_IMAGE}
+  variables:
+    KUBECONFIG: ${CI_PROJECT_DIR}/kube_config
+    NODE_VERSION: "node:12.13-buster-sli"
+    PROJECT_NAME: "[REDACTED]"
+    APP_NAME: "[REDACTED]"
+    HELM_VERSION: "dtzar/helm-kubectl:3.1.1"
+    APPLICATION_PORT: 80 # default value, mut be adjusted to your needs
+    REPLICACOUNT: 1 # default Used to guarantee the availability of a specified number of identical Pods.
+    CI_DEBUG_TRACE: "false"
+    DB_PORT: 5432
+    DB_NAME: [REDACTED]
+    CLIENT_APP_NAME: "[REDACTED]"
+    IAM_FRONT_CLIENT_ID: [REDACTED]
+    POSTMAN_USER_ID: [REDACTED]
+    HELM_EXPERIMENTAL_OCI:  1
+    DEV_API_URL: "[REDACTED]"
+  needs:
+    - job: helm_deploy_dev
+  before_script:
+    - export  HELM_EXPERIMENTAL_OCI=1
+    - az login --service-principal --username [REDACTED]  --password ${AZURE_CONTAINER_REGISTRY_USER} --tenant [REDACTED]
+    - helm registry login [REDACTED].azurecr.io   --username [REDACTED]  --password ${AZURE_CONTAINER_REGISTRY_USER}
+    - export LOWER_CASE_APP_NAME="$(echo "${APP_NAME}" | tr A-Z a-z | sed "s~/~~g"  )"
+    - export DNS_APP_NAME="$(echo "${APP_NAME}" | tr A-Z a-z |   sed "s~/~~g" | sed "s~-~~g"  )"
+    - echo ${KUBE_CONFIG_DEV} | base64 -d > ${KUBECONFIG}
+    - export KUBECONFIG=${KUBECONFIG}
+    - helm chart pull [REDACTED].azurecr.io/helm/panth-api:latest
+    - helm chart export [REDACTED].azurecr.io/helm/panth-api:latest --destination .
+    - ls -lth
+    - cd story-api/
+    # - helm delete ${LOWER_CASE_APP_NAME} -n dev || true
+    - echo ${CLIENT_URL}
+  script:
+    - export LOWER_CASE_APP_NAME="$(echo "${APP_NAME}" | tr A-Z a-z | sed "s~/~~g"  )"
+    - export DNS_APP_NAME="$(echo "${APP_NAME}" | tr A-Z a-z |   sed "s~/~~g" | sed "s~-~~g"  )"
+    - echo "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA"
+    - export CLIENT_LOWER_CASE_APP_NAME="$(echo "${CLIENT_APP_NAME}" | tr A-Z a-z | sed "s~/~~g"  )"
+    - export CLIENT_DNS_APP_NAME="$(echo "${CLIENT_APP_NAME}" | tr A-Z a-z |   sed "s~/~~g" | sed "s~-~~g"  )"
+    - export CLIENT_URL="[REDACTED]"
+    - echo $CLIENT_URL
+    # - export KUBECONFIG=${KUBECONFIG}
+    - kubectl get pods -n dev
+    - echo " >>>>>>>>>> Deploy in progress for tdf-montreal-k8s in DEV <<<<<<<<<< "
+    - helm dep update
+    - code=$(curl -s -o /dev/null -w "%{http_code}" '[REDACTED]/')
+    - |
+        if [[ $code == 5* ]]; then
+          helm rollback ${LOWER_CASE_APP_NAME} 0 --namespace dev
+        else
+          echo "helm chart deployment successful"  
+        fi    
+  only:
+    - master        
+  
