@@ -1,0 +1,68 @@
+---
+- hosts: localhost
+  order: sorted
+  connection: local
+  gather_facts: false
+  vars:
+    ANSIBLE_DUPLICATE_YAML_DICT_KEY: ignore
+    gitlab_api_url: gitlab.thalesdigital.io
+    gitlab_token: "{{ vault_api_token }}"
+    parthenon:
+    - [PARTH_TOKEN, "{{vault_panth_token}}" , "*"]
+    - [REACT_APP_APP_INSIGHTS, "{{vault_react_app_app_insights}}" , "PROD"]
+    - [REACT_APP_APP_INSIGHTS_DEV, "{{vault_react_app_app_insights_dev}}" , "DEV"]
+    - [REACT_APP_BING_MAP_KEY, "{{vault_react_app_bing_map}}" , "*"]
+    - [REACT_APP_E2E_PASSWORD, "{{vault_react_app_e2e_password}}" , "DEV"]
+    
+# PARTHENON
+  - name:  Create PARTHENON
+    uri:
+      url: "https://gitlab.thalesdigital.io/api/v4/projects/8945/variables "
+      method: POST
+      headers:
+            PRIVATE-TOKEN: "{{gitlab_token}}"
+            Content-Type: "application/json"
+      body:
+        { 
+        "key" : "{{ item.0 }}" ,
+        "value":  "{{ item.1 }}" ,
+        "environment_scope": "{{ item.2 }}"
+        }
+      status_code: 200 , 201 , 202 , 203 , 204
+      body_format: json
+    with_items:
+      - "{{ parthenon }}"
+    tags: ["PARTHENON-CREATE"]
+ 
+ 
+  - name:  Update PARTHENON
+    uri:
+      url: "https://gitlab.thalesdigital.io/api/v4/projects/8945/variables/{{ item.0 }} "
+      method: PUT
+      headers:
+            PRIVATE-TOKEN: "{{gitlab_token}}"
+            Content-Type: "application/json"
+      body:
+        { 
+        "key" : "{{ item.0 }}" ,
+        "value":  "{{ item.1 }}" ,
+        "environment_scope": "{{ item.2 }}"
+        }
+      status_code: 200 , 201 , 202 , 203 , 204
+      body_format: json
+    with_items:
+      - "{{ parthenon }}"
+    tags: ["PARTHENON-UPDATE"]
+ 
+  - name: DELETE Parthenon
+    uri:
+      url: "https://gitlab.thalesdigital.io/api/v4/projects/8945/variables/{{ item.0 }}"
+      method: DELETE
+      headers:
+            PRIVATE-TOKEN: "{{gitlab_token}}"
+            Content-Type: "application/json"
+      status_code: 200 , 201 , 202 , 203 , 204
+      body_format: json
+    with_items:
+      - "{{ parthenon }}"
+    tags: ["PARTHENON-DELETE"]
