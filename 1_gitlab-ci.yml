@@ -1,0 +1,25 @@
+tls_check_dev:
+  stage: tls_check_dev
+  image: ubuntu
+  script:
+    - apt-get update && apt-get install docker.io -y
+    - docker run --rm  $SSLSCAN_IMAGE $APP_CLIENT_URL_DEV > DEV.txt
+    - >
+      if cat DEV.txt | grep -i '(deprecated)'; then
+        echo 'High severity 1.0 or 1.1 found -- fail build'
+        exit0
+      else
+        echo 'All Good'
+      fi
+  artifacts:
+    expire_in: 1 mos
+    paths:
+     - DEV.txt
+  needs:
+    - push_to_dev
+  retry:
+    max: 2
+    when:
+       - always
+  only:
+    - master
